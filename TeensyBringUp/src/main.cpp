@@ -51,32 +51,33 @@ struct Timing { //This is for calculating bus budget
   }
 };
  
-bool readRegister(uint8_t address, uint8_t reg, uint8_t* data, uint8_t length, Timing* timing = nullptr) {
+bool readRegister(TwoWire& bus, uint8_t address, uint8_t reg, uint8_t* data, uint8_t length, Timing* timing = nullptr) {
   const uint32_t started = micros();
-  Wire.beginTransmission(address);
-  Wire.write(reg); //setup of the register and address to read from
-  bool ok = Wire.endTransmission(false) == 0 && Wire.requestFrom(address, length) == length; //checks if the transmission was successful and if the amount of bytes requested is equal to the amount of bytes received
-  for (uint8_t i = 0; ok && i < length; ++i) data[i] = static_cast<uint8_t>(Wire.read());
-  while (Wire.available()) Wire.read();
+  bus.beginTransmission(address);
+  bus.write(reg); //setup of the register and address to read from
+  bool ok = bus.endTransmission(false) == 0 && bus.requestFrom(address, length) == length; //checks if the transmission was successful and if the amount of bytes requested is equal to the amount of bytes received
+  for (uint8_t i = 0; ok && i < length; ++i) data[i] = static_cast<uint8_t>(bus.read());
+  while (bus.available()) bus.read();
   if (timing) timing->record(micros() - started);
   return ok;
 }
  
-bool writeRegister(uint8_t address, uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(address);
-  Wire.write(reg);
-  Wire.write(value);
-  return Wire.endTransmission() == 0;
+bool writeRegister(TwoWire& bus, uint8_t address, uint8_t reg, uint8_t value) {
+  bus.beginTransmission(address);
+  bus.write(reg);
+  bus.write(value);
+  return bus.endTransmission() == 0;
 }
  
 class Barometer {
  public:
+ explicit Barometer(TwoWire& bus) : bus_(bus) {}
   bool begin() {
     uint8_t chipId = 0;
-    ready_ = readRegister(kBmpAddress, kBmpChipIdReg, &chipId, 1) && chipId == 0x60 &&
-             bmp_.begin_I2C(kBmpAddress, &Wire);
+    ready_ = readRegister(bus_, kBmpAddress, kBmpChipIdReg, &chipId, 1) && chipId == 0x60 &&
+             bmp_.begin_I2C(kBmpAddress, &bus_);
     if (!ready_) return false;
-    Wire.setClock(kI2cClockHz); //restore bus speed just in case
+    bus_.setClock(kI2cClockHz); //restore bus speed just in case
     bmp_.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
     bmp_.setPressureOversampling(BMP3_OVERSAMPLING_4X);//oversampling more since this gives altitude
     bmp_.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3); //I think this should be fine for the rocket but could potentially be decreased
@@ -88,7 +89,7 @@ class Barometer {
     const bool readOk = bmp_.performReading();
     dataTiming_.record(micros() - started);
     fault = 0xFF; //reading the sensor's errors
-    const bool faultReadOk = readRegister(kBmpAddress, kBmpErrorReg, &fault, 1, &errorTiming_);
+    const bool faultReadOk = readRegister(bus_, kBmpAddress, kBmpErrorReg, &fault, 1, &errorTiming_);
     if (!readOk || !faultReadOk || fault != 0) { //if anything went wrong
       ready_ = false;
       return false;
@@ -100,11 +101,12 @@ class Barometer {
  
   bool ready() const { return ready_; }
   void reportTiming() {
-    dataTiming_.report("bmp_data");
-    errorTiming_.report("bmp_error");
+    dataTiming_.report("i2c0_bmp_data");
+    errorTiming_.report("i2c0_bmp_error");
   }
  
  private:
+  TwoWire& bus_;
   Adafruit_BMP3XX bmp_;
   Timing dataTiming_, errorTiming_;
   bool ready_ = false;
@@ -116,35 +118,36 @@ struct Acceleration {
  
 class Accelerometer {
  public:
+  explicit Accelerometer(TwoWire& bus) : bus_(bus) {}
   bool begin() {
     uint8_t id = 0;
-    ready_ = readRegister(kAdxlAddress, kAdxlDeviceIdReg, &id, 1) && id == 0xE5 && //check if the device is present and has the correct ID
-             writeRegister(kAdxlAddress, kAdxlBandwidthReg, 0x0D) && //Bandwith set to 800 Hz
-             writeRegister(kAdxlAddress, kAdxlDataFormatReg, 0x0B) && //+/- 200g range
-             writeRegister(kAdxlAddress, kAdxlFifoControlReg, 0x00) && //clears the old data in the FIFO
-             writeRegister(kAdxlAddress, kAdxlFifoControlReg, fifo_ ? 0x80 : 0x00) && //sets the FIFO mode to stream mode
-             writeRegister(kAdxlAddress, kAdxlPowerReg, 0x08); //puts the device into measurement mode
+    ready_ = readRegister(bus_, kAdxlAddress, kAdxlDeviceIdReg, &id, 1) && id == 0xE5 && //check if the device is present and has the correct ID
+             writeRegister(bus_, kAdxlAddress, kAdxlBandwidthReg, 0x0D) && //Bandwith set to 800 Hz
+             writeRegister(bus_, kAdxlAddress, kAdxlDataFormatReg, 0x0B) && //+/- 200g range
+             writeRegister(bus_, kAdxlAddress, kAdxlFifoControlReg, 0x00) && //clears the old data in the FIFO
+             writeRegister(bus_, kAdxlAddress, kAdxlFifoControlReg, fifo_ ? 0x80 : 0x00) && //sets the FIFO mode to stream mode
+             writeRegister(bus_, kAdxlAddress, kAdxlPowerReg, 0x08); //puts the device into measurement mode
     return ready_; //did everything succeed
   }
  
   void setFifo(bool enable) {
     fifo_ = enable;
     if (ready_) {
-      ready_ = writeRegister(kAdxlAddress, kAdxlFifoControlReg, 0x00) &&
-               writeRegister(kAdxlAddress, kAdxlFifoControlReg, enable ? 0x80 : 0x00);
+      ready_ = writeRegister(bus_, kAdxlAddress, kAdxlFifoControlReg, 0x00) &&
+               writeRegister(bus_, kAdxlAddress, kAdxlFifoControlReg, enable ? 0x80 : 0x00);
     }
   }
  
   bool pending(uint8_t& count, bool& overrun) { //decides how many samples to get and if any samples were overwritten
     uint8_t value = 0;
-    if (!readRegister(kAdxlAddress, fifo_ ? kAdxlFifoStatusReg : kAdxlIntSourceReg, &value, 1, &statusTiming_)) {
+    if (!readRegister(bus_, kAdxlAddress, fifo_ ? kAdxlFifoStatusReg : kAdxlIntSourceReg, &value, 1, &statusTiming_)) {
       ready_ = false; //The above read failed, so the device is not ready to be read from
       return false;
     }
     if (fifo_) { //stream mode
       count = value & 0x3F; //FIFO count is the lower 6 bits of the FIFO status register
       uint8_t src = 0;  //sample was overwritten
-      if (!readRegister(kAdxlAddress, kAdxlIntSourceReg, &src, 1, &statusTiming_)) {
+      if (!readRegister(bus_, kAdxlAddress, kAdxlIntSourceReg, &src, 1, &statusTiming_)) {
         ready_ = false;
         return false;
       }
@@ -158,7 +161,7 @@ class Accelerometer {
  
   bool read(Acceleration& sample) {
     uint8_t d[6];
-    if (!readRegister(kAdxlAddress, kAdxlDataReg, d, 6, &dataTiming_)) { //if the read failed, then the device is not ready to be read from
+    if (!readRegister(bus_, kAdxlAddress, kAdxlDataReg, d, 6, &dataTiming_)) { //if the read failed, then the device is not ready to be read from
       ready_ = false;
       return false;
     }
@@ -171,18 +174,19 @@ class Accelerometer {
   bool ready() const { return ready_; }
   uint32_t pollPeriodUs() const { return fifo_ ? kFifoPollPeriodUs : kBypassPollPeriodUs; }
   void reportTiming() {
-    dataTiming_.report("adxl_data");
-    statusTiming_.report("adxl_status");
+    dataTiming_.report("i2c1_adxl_data");
+    statusTiming_.report("i2c1_adxl_status");
   }
  
  private:
+  TwoWire& bus_;
   Timing dataTiming_, statusTiming_;
   bool ready_ = false;
   bool fifo_ = true;
 };
  
-Barometer barometer;
-Accelerometer accelerometer;
+Barometer barometer(Wire);
+Accelerometer accelerometer(Wire1);
  
 uint8_t errorFlags = 0;
 uint32_t nextAccelUs = 0, nextBarometerUs = 0, nextReportUs = 0;
@@ -281,6 +285,8 @@ void setup() { //Initialize
   Serial.begin(115200);
   Wire.begin();
   Wire.setClock(kI2cClockHz);
+  Wire1.begin();
+  Wire1.setClock(kI2cClockHz);
   barometer.begin();
   accelerometer.begin();
   const uint32_t now = micros();
