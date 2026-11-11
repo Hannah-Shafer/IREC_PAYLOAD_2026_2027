@@ -31,6 +31,8 @@ constexpr uint8_t kErrorAdxlUnavailable = 1U << 1;
 constexpr uint8_t kErrorBmpInternal = 1U << 2;
 constexpr uint8_t kErrorAccelOverrun = 1U << 3;
 constexpr uint8_t kErrorBarometerLate = 1U << 4;
+
+constexpr uint32_t kI2cTimeoutUs = 5000;
  
 inline unsigned long ul(uint32_t v) { return static_cast<unsigned long>(v); }
  
@@ -58,15 +60,25 @@ bool readRegister(TwoWire& bus, uint8_t address, uint8_t reg, uint8_t* data, uin
   bool ok = bus.endTransmission(false) == 0 && bus.requestFrom(address, length) == length; //checks if the transmission was successful and if the amount of bytes requested is equal to the amount of bytes received
   for (uint8_t i = 0; ok && i < length; ++i) data[i] = static_cast<uint8_t>(bus.read());
   while (bus.available()) bus.read();
-  if (timing) timing->record(micros() - started);
-  return ok;
+  const uint32_t elapsed = micros() - started;
+  if (timing) timing->record(elapsed);
+  return ok && elapsed < kI2cTimeoutUs;
 }
  
 bool writeRegister(TwoWire& bus, uint8_t address, uint8_t reg, uint8_t value) {
   bus.beginTransmission(address);
   bus.write(reg);
   bus.write(value);
-  return bus.endTransmission() == 0;
+  const uint32_t started = micros();
+  bool ok = bus.endTransmission() == 0;
+  const uint32_t elapsed = micros() - started;
+  return ok && elapsed < kI2cTimeoutUs;
+}
+
+void restartBus(TwoWire& bus) {
+  bus.end();
+  bus.begin();
+  bus.setClock(kI2cClockHz);
 }
  
 class Barometer {
@@ -200,6 +212,36 @@ float groundPa = 0;
  
 bool due(uint32_t now, uint32_t when) { return static_cast<int32_t>(now - when) >= 0; }
  
+
+uint32_t nextBmpRetryUs = 0;
+uint32_t nextAdxlRetryUs = 0;
+void Recovery(uint32_t now) { //This function attempts to recover the barometer and accelerometer if they are not ready
+  if (barometer.ready()) {
+    nextBmpRetryUs = now + 1000000; //retry every second
+  }
+  else {
+    errorFlags |= kErrorBmpUnavailable; //if the barometer is not ready, then set the error flag
+    if (due(now, nextBmpRetryUs)) {
+      nextBmpRetryUs = now + 1000000; //retry every second
+      restartBus(Wire); //restart the I2C bus to try to recover the barometer
+      if (barometer.begin()) nextBarometerUs = micros();
+    }
+  }
+  if (accelerometer.ready()) {
+    nextAdxlRetryUs = now + 1000000; //retry every second
+  }
+  else {
+    errorFlags |= kErrorAdxlUnavailable; //if the accelerometer is not ready, then set the error flag
+    if (due(now, nextAdxlRetryUs)) {
+      nextAdxlRetryUs = now + 1000000; //retry every second
+      restartBus(Wire1); //restart the I2C bus to try to recover the accelerometer
+      if (accelerometer.begin()) nextAccelUs = micros();
+    }
+  }
+}
+
+
+
 void serviceAccelerometer(uint32_t now) { //This function services the accelerometer, reading data from it and printing it to the serial port
   if (!accelerometer.ready() || !due(now, nextAccelUs)) return;
   nextAccelUs = now + accelerometer.pollPeriodUs(); //schedule the next time to read from the accelerometer
@@ -268,8 +310,6 @@ void serviceCommands() { //This function services the serial commands, reading f
 void serviceReport(uint32_t now) { //This function services the report, printing the timing information for the barometer and accelerometer to the serial port
   if (!due(now, nextReportUs)) return;
   nextReportUs = now + kReportPeriodUs;
-  if (!barometer.ready()) errorFlags |= kErrorBmpUnavailable;
-  if (!accelerometer.ready()) errorFlags |= kErrorAdxlUnavailable;
   barometer.reportTiming();
   accelerometer.reportTiming();
   Serial.printf("RATE,missed_accel=%lu,missed_baro=%lu,accel_hz=%lu,baro_hz=%lu,errors=0x%02X\n", ul(missedAccel),
@@ -277,7 +317,9 @@ void serviceReport(uint32_t now) { //This function services the report, printing
                 errorFlags);
   lastAccelCount = accelCount;
   lastBarometerCount = barometerCount;
-  errorFlags = 0; 
+  errorFlags = 0;
+  if (!barometer.ready()) errorFlags |= kErrorBmpUnavailable;
+  if (!accelerometer.ready()) errorFlags |= kErrorAdxlUnavailable;
 }
 }
  
@@ -299,5 +341,6 @@ void loop() { //Main loop of the program
   serviceCommands();
   serviceAccelerometer(now);
   serviceBarometer(now);
+  
   serviceReport(now);
 }
